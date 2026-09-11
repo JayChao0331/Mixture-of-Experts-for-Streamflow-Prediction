@@ -1,0 +1,72 @@
+attribute_means:
+  MAX_Elev: 3084.714285714286
+  MEAN_Elev: 1560.0883746605848
+  Percent_Area_Land_0: 0.1484511929085142
+  Percent_Area_Land_1: 0.23255837043909808
+  Percent_Area_Land_10: 0.04096642504927783
+  Percent_Area_Land_11: 0.019309851104892327
+  Percent_Area_Land_14: 0.00015394088669950715
+  Percent_Area_Land_4: 0.00036005600722914283
+  Percent_Area_Land_5: 0.0006293315416283999
+  Percent_Area_Land_6: 0.37600725529270135
+  Percent_Area_Land_7: 0.14314687340763577
+  Percent_Area_Land_8: 0.02600379348793577
+  Percent_Area_Land_9: 0.01241290987438782
+  SD_Elev: 684.4376734985428
+attribute_stds:
+  MAX_Elev: 676.9027232204763
+  MEAN_Elev: 380.16472086794056
+  Percent_Area_Land_0: 0.03471271203740091
+  Percent_Area_Land_1: 0.12646872917753485
+  Percent_Area_Land_10: 0.0351923924677156
+  Percent_Area_Land_11: 0.03970084543485321
+  Percent_Area_Land_14: 0.0005759940558457411
+  Percent_Area_Land_4: 0.0010470141816436738
+  Percent_Area_Land_5: 0.001365898639497572
+  Percent_Area_Land_6: 0.12125010689357228
+  Percent_Area_Land_7: 0.06690702809067822
+  Percent_Area_Land_8: 0.03204348818484725
+  Percent_Area_Land_9: 0.018829593112438734
+  SD_Elev: 201.24390223352722
+xarray_feature_scale:
+  coords: {}
+  attrs: {}
+  dims: {}
+  data_vars:
+    discharge:
+      dims: []
+      attrs: {}
+      data: 2.393563747406006
+    pr_x:
+      dims: []
+      attrs: {}
+      data: 8.701120376586914
+    tmax_x:
+      dims: []
+      attrs: {}
+      data: 8.84186840057373
+    tmin_x:
+      dims: []
+      attrs: {}
+      data: 6.535915374755859
+xarray_feature_center:
+  coords: {}
+  attrs: {}
+  dims: {}
+  data_vars:
+    discharge:
+      dims: []
+      attrs: {}
+      data: 1.3393468856811523
+    pr_x:
+      dims: []
+      attrs: {}
+      data: 2.815471887588501
+    tmax_x:
+      dims: []
+      attrs: {}
+      data: 16.967422485351562
+    tmin_x:
+      dims: []
+      attrs: {}
+      data: 3.570002317428589
