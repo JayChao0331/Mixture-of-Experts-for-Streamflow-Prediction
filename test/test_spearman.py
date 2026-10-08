@@ -1,4 +1,4 @@
-"""Verify standalone Spearman plotting against the original scientific analysis."""
+"""Verify standalone Spearman inference and the scientific distance definitions."""
 
 from pathlib import Path
 import shutil
@@ -9,13 +9,11 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+import xarray as xr
+from scipy.stats import ks_2samp
 
 from analysis import plot_spearman as spearman
-from analysis.analyze_moe_tau_experts import (
-    _watershed_distribution_expert_similarity,
-    add_hydrologic_context,
-    extract_gate_table,
-)
+from test.gate_reference import reference_gate_table
 from neuralhydrology.datasetzoo import get_dataset
 from neuralhydrology.modelzoo import get_model
 from neuralhydrology.utils.config import Config
@@ -50,28 +48,39 @@ def saved_run(tmp_path_factory):
 
 
 @pytest.mark.parametrize("period", ["train", "validation", "test"])
-def test_distances_match_original_analysis(saved_run, period):
+def test_inference_and_distance_definitions(saved_run, period):
     run_dir, cfg = saved_run
     scaler_file = run_dir / "train_data/train_data_scaler.yml"
     original_scaler = scaler_file.read_bytes()
     actual = spearman.extract_gate_and_hydroclimate_table(
         run_dir / "model_epoch000.pt", BASINS, period=period, batch_size=5)
-    original = extract_gate_table(cfg, run_dir, BASINS, period, 0, "cpu", 14, False)
-    expected = add_hydrologic_context(original, ROOT / "processed_data", BASINS)
+    expected = reference_gate_table(cfg, run_dir, BASINS, period)
+    for basin_id in BASINS:
+        with xr.open_dataset(ROOT / "processed_data/time_series" / f"{basin_id}.nc") as dataset:
+            climate = dataset.to_dataframe()
+        climate["pr_7d"] = climate["pr_x"].rolling(7, min_periods=1).sum()
+        climate["pr_30d"] = climate["pr_x"].rolling(30, min_periods=1).sum()
+        climate["tmean"] = (climate["tmax_x"] + climate["tmin_x"]) / 2
+        rows = expected["basin_id"] == basin_id
+        for variable in ("pr_x", "pr_7d", "pr_30d", "tmean"):
+            expected.loc[rows, variable] = climate.loc[expected.loc[rows, "date"], variable].to_numpy()
     columns = ["qobs", "pr_x", "pr_7d", "pr_30d", "tmean"] + [f"expert_{i}_gate" for i in range(8)]
     pd.testing.assert_frame_equal(actual[["basin_id", "date"]], expected[["basin_id", "date"]])
     np.testing.assert_allclose(actual[columns], expected[columns], rtol=1e-6, atol=1e-7, equal_nan=True)
     for reference_id in ["4", "8", "15"]:
         actual_distances = spearman.calculate_watershed_distances(actual, reference_id)
-        expected_distances = _watershed_distribution_expert_similarity(
-            expected, reference_id, list(spearman.DISTRIBUTION_VARIABLES))
-        assert actual_distances["basin_id"].tolist() == expected_distances["basin_id"].tolist()
-        distance_columns = ["distribution_distance", "expert_l1_distance"] + [f"{v}_ks" for v in spearman.DISTRIBUTION_VARIABLES]
-        np.testing.assert_allclose(actual_distances[distance_columns], expected_distances[distance_columns],
-                                   rtol=1e-6, atol=1e-7)
-        actual_r = actual_distances["distribution_distance"].corr(actual_distances["expert_l1_distance"], method="spearman")
-        expected_r = expected_distances["distribution_distance"].corr(expected_distances["expert_l1_distance"], method="spearman")
-        assert actual_r == pytest.approx(expected_r)
+        gate_cols = [f"expert_{i}_gate" for i in range(8)]
+        mean_gates = expected.groupby("basin_id")[gate_cols].mean().astype(float)
+        mean_gates = mean_gates.div(mean_gates.sum(axis=1), axis=0)
+        reference = expected[expected["basin_id"] == reference_id]
+        for _, row in actual_distances.iterrows():
+            candidate = expected[expected["basin_id"] == row["basin_id"]]
+            ks_values = [ks_2samp(reference[v].dropna(), candidate[v].dropna()).statistic
+                         for v in spearman.DISTRIBUTION_VARIABLES]
+            assert row["distribution_distance"] == pytest.approx(np.mean(ks_values))
+            np.testing.assert_allclose(row[[f"{v}_ks" for v in spearman.DISTRIBUTION_VARIABLES]].astype(float), ks_values)
+            assert row["expert_l1_distance"] == pytest.approx(
+                np.abs(mean_gates.loc[reference_id] - mean_gates.loc[row["basin_id"]]).sum(), abs=1e-6)
         assert reference_id not in actual_distances["basin_id"].tolist()
     assert scaler_file.read_bytes() == original_scaler
 
@@ -133,3 +142,38 @@ def test_checkpoint_selection(tmp_path):
     assert spearman._select_checkpoint(run_dir=tmp_path, epoch=0).name == "model_epoch000.pt"
     with pytest.raises(ValueError, match="omit it when selecting an exact checkpoint file"):
         spearman._select_checkpoint(checkpoint=tmp_path / "model_epoch000.pt", epoch=0)
+
+
+def test_training_distances_retain_observations_with_missing_history(saved_run, tmp_path, capsys):
+    original_run, _ = saved_run
+    run_dir = tmp_path / "warmup_run"
+    shutil.copytree(original_run, run_dir)
+    config_file = run_dir / "config.yml"
+    cfg = Config(config_file)
+    cfg.update_config({"seq_length": 365, "train_start_date": "01/10/1987", "train_end_date": "03/10/1988"})
+    config_file.unlink()
+    cfg.dump_config(run_dir, filename="config.yml")
+    table = spearman.extract_gate_and_hydroclimate_table(run_dir / "model_epoch000.pt", ["1"],
+                                                       period="train", batch_size=128)
+    expected = reference_gate_table(cfg, run_dir, ["1"], "train")
+    gate_cols = [f"expert_{i}_gate" for i in range(8)]
+    assert len(table) == 369
+    assert table[gate_cols].iloc[:364].isna().all().all()
+    assert table["qobs"].notna().sum() == expected["qobs"].notna().sum()
+    assert table["qobs"].iloc[:364].notna().any()
+    np.testing.assert_allclose(table[["qobs"] + gate_cols], expected[["qobs"] + gate_cols],
+                               rtol=1e-6, atol=1e-7, equal_nan=True)
+    assert table["pr_30d"].notna().all()
+    assert "Excluded 364 train sequences" in capsys.readouterr().out
+
+
+def test_invalid_weights_are_rejected(saved_run, tmp_path):
+    original_run, _ = saved_run
+    run_dir = tmp_path / "invalid_run"
+    shutil.copytree(original_run, run_dir)
+    checkpoint = run_dir / "model_epoch000.pt"
+    state = torch.load(checkpoint, weights_only=True)
+    state["gating_net.proj.weight"][0, 0] = float("nan")
+    torch.save(state, checkpoint)
+    with pytest.raises(ValueError, match="Checkpoint contains non-finite parameters"):
+        spearman.extract_gate_and_hydroclimate_table(checkpoint, ["1"])

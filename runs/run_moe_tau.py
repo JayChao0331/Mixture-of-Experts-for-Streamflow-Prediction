@@ -25,6 +25,7 @@ from neuralhydrology.evaluation import metrics
 from neuralhydrology.nh_run import eval_run
 from neuralhydrology.training.train import start_training
 from neuralhydrology.utils.config import Config
+from neuralhydrology.utils.checkpoints import select_checkpoint
 
 
 data_dir = "./final_data_stage1_training_val_071824"
@@ -472,13 +473,13 @@ def _distributed_debug_worker(rank: int, gpu_ids, master_port: int):
         dist.destroy_process_group()
 
 
-def run_experiments(times=10, gpu: int = None):
+def run_experiments(times=10, gpu: int = None, config_file: Path = CONFIG_FILE):
     """Train repeated runs from the preserved MoE-tau configuration."""
     if times < 1:
         raise ValueError("times must be at least 1.")
     run_dirs = []
     for _ in range(times):
-        run_dir = _start_training_from_config(CONFIG_FILE, gpu=gpu)
+        run_dir = _start_training_from_config(config_file, gpu=gpu)
         run_dirs.append(run_dir)
         print(f"Finished MoE-tau training run: {run_dir}")
     return run_dirs
@@ -585,9 +586,7 @@ def _prepare_area_fold_config(fold_key: str, fold_info: dict) -> Path:
 
 
 def _get_weight_stem(run_dir: Path, epoch: int = None) -> str:
-    if epoch is None:
-        return sorted(list(run_dir.glob("model_epoch*.pt")))[-1].stem
-    return f"model_epoch{epoch:03d}"
+    return select_checkpoint(run_dir=run_dir, epoch=epoch).stem
 
 
 def _evaluate_single_heldout_basin(run_dir: Path, basin_id: str, epoch: int = None) -> dict:
@@ -1444,6 +1443,8 @@ def _main():
     parser.add_argument("--period", choices=["train", "validation", "test"], default="test")
     parser.add_argument("--epoch", type=int, help="Checkpoint epoch to evaluate (default: latest).")
     parser.add_argument("--gpu", type=int, help="Override the configured GPU; use -1 for CPU.")
+    parser.add_argument("--config", type=Path, default=CONFIG_FILE,
+                        help="Training configuration (default: runs/moe_tau.yml).")
     args = parser.parse_args()
 
     if args.times < 1:
@@ -1451,7 +1452,7 @@ def _main():
     if args.mode in {"train-test", "train"}:
         if args.run_dir is not None:
             parser.error("--run-dir is only used with evaluate.")
-        run_dirs = run_experiments(times=args.times, gpu=args.gpu)
+        run_dirs = run_experiments(times=args.times, gpu=args.gpu, config_file=args.config)
         if args.mode == "train-test":
             for run_dir in run_dirs:
                 eval_run(run_dir=run_dir, period=args.period, epoch=args.epoch, gpu=args.gpu)

@@ -157,10 +157,33 @@ def eval_run(run_dir: Path, period: str, epoch: int = None, gpu: int = None):
         GPU id to use. Will override config argument 'device'. A value less than zero indicates CPU.
 
     """
+    run_dir = Path(run_dir).expanduser().resolve()
     config = Config(run_dir / "config.yml")
     # A saved config can contain an absolute run_dir from another machine/user.
     # During evaluation, run-local artifacts must be loaded from the run_dir passed by the caller.
     config.run_dir = run_dir
+    if config.model == "moe_lstm_attn_learnable_temp_gating":
+        # The rename preserved the model architecture and state-dict keys.
+        config.update_config({"model": "moe_tau"})
+    if config.model == "moe_tau":
+        project_root = Path(__file__).resolve().parents[1]
+        updates = {"train_dir": run_dir / "train_data", "img_log_dir": run_dir / "img_log"}
+        # Older CDEC runs contain paths from examples/07-CDEC on another machine.
+        # Prefer existing configured data, then the prepared data in this checkout.
+        for key in ("data_dir", "train_basin_file", "validation_basin_file", "test_basin_file"):
+            configured = getattr(config, key)
+            if configured is None:
+                continue
+            path = Path(configured).expanduser()
+            if not path.exists() and not path.is_absolute():
+                path = project_root / path
+            if not path.exists():
+                # Only relocate the project's known CDEC inputs, not arbitrary custom data.
+                default = project_root / ("processed_data" if key == "data_dir" else "cdec_nondet_basin.txt")
+                if path.name == default.name and default.exists():
+                    path = default
+            updates[key] = path.resolve()
+        config.update_config(updates)
 
     # check if a GPU has been specified as command line argument. If yes, overwrite config
     if gpu is not None and gpu >= 0:

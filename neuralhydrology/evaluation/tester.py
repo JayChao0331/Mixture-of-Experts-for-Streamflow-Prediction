@@ -25,6 +25,7 @@ from neuralhydrology.modelzoo.basemodel import BaseModel
 from neuralhydrology.training import get_loss_obj, get_regularization_obj
 from neuralhydrology.training.logger import Logger
 from neuralhydrology.utils.config import Config
+from neuralhydrology.utils.checkpoints import load_model_weights, select_checkpoint
 from neuralhydrology.utils.errors import AllNaNError, NoEvaluationDataError
 
 LOGGER = logging.getLogger(__name__)
@@ -118,19 +119,14 @@ class BaseTester(object):
 
     def _get_weight_file(self, epoch: int):
         """Get file path to weight file"""
-        if epoch is None:
-            weight_file = sorted(list(self.run_dir.glob('model_epoch*.pt')))[-1]
-        else:
-            weight_file = self.run_dir / f"model_epoch{str(epoch).zfill(3)}.pt"
-
-        return weight_file
+        return select_checkpoint(run_dir=self.run_dir, epoch=epoch)
 
     def _load_weights(self, epoch: int = None):
         """Load weights of a certain (or the last) epoch into the model."""
         weight_file = self._get_weight_file(epoch)
 
         LOGGER.info(f"Using the model weights from {weight_file}")
-        self.model.load_state_dict(torch.load(weight_file, map_location=self.device))
+        load_model_weights(self.model, weight_file, self.device)
 
     def _get_dataset(self, basin: str) -> BaseDataset:
         """Get dataset for a single basin."""

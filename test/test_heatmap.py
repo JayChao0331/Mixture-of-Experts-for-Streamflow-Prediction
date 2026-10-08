@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from analysis import plot_heatmap as heatmap
-from analysis.analyze_moe_tau_experts import extract_gate_table
+from test.gate_reference import reference_gate_table
 from neuralhydrology.datasetzoo import get_dataset
 from neuralhydrology.modelzoo import get_model
 from neuralhydrology.utils.config import Config
@@ -44,7 +44,7 @@ def saved_run(tmp_path_factory):
     return run_dir, cfg
 
 
-def test_inference_and_regime_means_match_existing_analysis(saved_run, tmp_path, monkeypatch):
+def test_inference_and_regime_means_match_full_model(saved_run, tmp_path, monkeypatch):
     run_dir, cfg = saved_run
     basin_ids = ["4", "8", "14", "15"]
     basin_file = tmp_path / "basins.txt"
@@ -63,7 +63,7 @@ def test_inference_and_regime_means_match_existing_analysis(saved_run, tmp_path,
     actual_tables = heatmap.extract_train_test_gate_tables(run_dir / "model_epoch000.pt", basin_file=basin_file,
                                                          batch_size=5)
     assert len(model_calls) == 1
-    reference_tables = [extract_gate_table(cfg, run_dir, basin_ids, period, 0, "cpu", 14, False)
+    reference_tables = [reference_gate_table(cfg, run_dir, basin_ids, period)
                         for period in ["train", "test"]]
     gate_cols = [f"expert_{i}_gate" for i in range(8)]
     for actual, expected in zip(actual_tables, reference_tables):
@@ -179,8 +179,8 @@ def test_missing_initial_history_is_excluded_before_inference(saved_run, tmp_pat
     assert test["date"].tolist() == pd.date_range("2000-02-01", "2000-02-14").tolist()
     assert "Excluded 364 train sequences for basin 1" in capsys.readouterr().out
     assert np.isfinite(test[gate_cols]).all().all()
-    # The original analyzer retains observed flows even when padded windows yield NaN gates.
-    expected = extract_gate_table(cfg, run_dir, ["1"], "train", 0, "cpu", 128, False)
+    # Observed flows remain available even when padded windows cannot produce gates.
+    expected = reference_gate_table(cfg, run_dir, ["1"], "train")
     np.testing.assert_allclose(train[["qobs"] + gate_cols], expected[["qobs"] + gate_cols],
                                rtol=1e-6, atol=1e-7, equal_nan=True)
     summary, _, thresholds = heatmap.summarize_train_test_gates(train, test)

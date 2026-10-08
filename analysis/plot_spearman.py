@@ -27,6 +27,7 @@ from neuralhydrology.datautils.utils import load_basin_file, load_scaler
 from neuralhydrology.datasetzoo import get_dataset
 from neuralhydrology.evaluation.utils import load_basin_id_encoding
 from neuralhydrology.modelzoo import get_model
+from neuralhydrology.utils.checkpoints import load_model_weights, select_checkpoint as _select_checkpoint
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.errors import NoEvaluationDataError
 
@@ -45,40 +46,6 @@ def _resolve_watershed(watershed: str) -> tuple:
             return basin_id, name
     raise ValueError(f"Unknown watershed '{watershed}'. Use a CDEC name or ID: "
                      + ", ".join(f"{name}/{basin_id}" for basin_id, name in BASIN_NAMES.items()))
-
-
-def _select_checkpoint(run_dir: Path = None, checkpoint: Path = None, epoch: int = None) -> Path:
-    if (run_dir is None) == (checkpoint is None):
-        raise ValueError("Specify either --run-dir or --checkpoint.")
-    if checkpoint is not None:
-        checkpoint = Path(checkpoint).expanduser().resolve()
-        if checkpoint.is_dir():
-            run_dir = checkpoint
-        else:
-            if not checkpoint.is_file():
-                raise FileNotFoundError(f"Checkpoint file or run directory not found: {checkpoint}")
-            if epoch is not None:
-                raise ValueError("--epoch applies to a run folder; omit it when selecting an exact checkpoint file.")
-            return checkpoint
-
-    run_dir = Path(run_dir).expanduser().resolve()
-    if not run_dir.exists():
-        raise FileNotFoundError(f"Run directory not found: {run_dir}")
-    if not run_dir.is_dir():
-        raise ValueError("--run-dir requires a folder. Use --checkpoint to select a .pt file.")
-    if epoch is not None:
-        if epoch < 0:
-            raise ValueError("--epoch must be non-negative.")
-        weight_file = run_dir / f"model_epoch{epoch:03d}.pt"
-    else:
-        weight_files = [path for path in run_dir.glob("model_epoch*.pt")
-                        if path.is_file() and path.stem[len("model_epoch"):].isdigit()]
-        if not weight_files:
-            raise FileNotFoundError(f"No model_epoch*.pt checkpoints found in {run_dir}")
-        weight_file = max(weight_files, key=lambda path: int(path.stem[len("model_epoch"):]))
-    if not weight_file.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {weight_file}")
-    return weight_file
 
 
 def _target_scaler_value(values, target: str) -> float:
@@ -126,11 +93,7 @@ def extract_gate_and_hydroclimate_table(checkpoint: Path,
     cfg.update_config({"run_dir": run_dir, "train_dir": run_dir / "train_data",
                        "data_dir": data_dir, "device": device})
     model = get_model(cfg).to(device)
-    try:
-        state_dict = torch.load(checkpoint, map_location=device, weights_only=True)
-    except TypeError:  # PyTorch versions without weights_only.
-        state_dict = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(state_dict)
+    load_model_weights(model, checkpoint, device)
     model.eval()
 
     scaler = load_scaler(run_dir)
@@ -153,20 +116,44 @@ def extract_gate_and_hydroclimate_table(checkpoint: Path,
         print(f"Computing {period} gates for {basin_name} ({basin_id}): {len(dataset)} samples.", flush=True)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=dataset.collate_fn)
         batches = []
+        used_samples = 0
+        skipped_samples = 0
         with torch.inference_mode():
             for batch in loader:
                 dates = pd.to_datetime(batch["date"][:, -1])
                 obs_norm = batch["y"][:, -1, 0].cpu().numpy()
+                gate_cols = [f"expert_{i}_gate" for i in range(model.num_experts)]
+                rows = pd.DataFrame(np.full((len(dates), model.num_experts), np.nan, dtype=np.float32),
+                                    columns=gate_cols)
+                rows["date"] = dates
+                rows["qobs"] = obs_norm * target_scale + target_center
+                valid = torch.ones(batch["x_d"].shape[0], dtype=torch.bool)
+                for key in ("x_d", "x_s", "x_one_hot"):
+                    if key in batch:
+                        valid &= torch.isfinite(batch[key]).reshape(len(valid), -1).all(dim=1)
+                skipped_samples += int((~valid).sum())
+                if not valid.any():
+                    # Retain observed data for KS distances even when no gates can be inferred.
+                    batches.append(rows)
+                    continue
+                if not valid.all():
+                    batch = {key: value[valid] if isinstance(value, torch.Tensor) else value[valid.numpy()]
+                             for key, value in batch.items()}
                 batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value
                          for key, value in batch.items()}
                 batch = model.pre_model_hook(batch, is_train=False)
                 gates = model.gating_net(model.embedding_net(batch))
                 if not torch.isfinite(gates).all():
                     raise ValueError(f"Non-finite gating weights for {basin_name}; check the checkpoint and inputs.")
-                rows = pd.DataFrame(gates.cpu().numpy(), columns=[f"expert_{i}_gate" for i in range(model.num_experts)])
-                rows["date"] = dates
-                rows["qobs"] = obs_norm * target_scale + target_center
+                rows.loc[valid.numpy(), gate_cols] = gates.cpu().numpy()
                 batches.append(rows)
+                used_samples += int(valid.sum())
+        if skipped_samples:
+            print(f"Excluded {skipped_samples} {period} sequences for {basin_name} with missing or non-finite inputs; "
+                  f"retained {used_samples}. Observed data remain available for KS distances.", flush=True)
+        if not used_samples:
+            raise ValueError(f"No finite {period} input sequences for {basin_name}; "
+                             "check available input history, prepared data, and the saved training scaler.")
         basin_frame = pd.concat(batches, ignore_index=True)
         basin_frame["basin_id"] = basin_id
         basin_frame["basin_name"] = basin_name

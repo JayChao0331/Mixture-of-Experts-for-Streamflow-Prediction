@@ -20,13 +20,13 @@ python3 -m pip install -r requirements.txt
 python3 runs/run_moe_tau.py
 ```
 
-This trains and tests MoE-tau using `runs/moe_tau.yml`. Results and checkpoints are saved in `runs/moe_tau_<timestamp>/`. Add `--gpu -1` to run on CPU.
+This trains and tests MoE-tau using `runs/moe_tau.yml`. Results are saved in `runs/moe_tau_<timestamp>/`, with the best training-loss checkpoint in `model_epoch000.pt`. Add `--gpu -1` to run on CPU.
 
 ## Analyses
 
 Replace `RUN_DIR` below with your trained run folder. Keep its saved `config.yml` and `train_data/` alongside the checkpoints.
 
-Each script runs independently and saves figures in `output/`. To select an exact checkpoint, replace `--run-dir RUN_DIR` with `--checkpoint /path/to/model_epoch199.pt`.
+Each script runs independently and saves figures in `output/`. Use the same run folder printed after training; no intermediate analysis files are needed. To select an exact checkpoint, replace `--run-dir RUN_DIR` with `--checkpoint /path/to/model_epoch000.pt`.
 
 ### Figure 5: Gating-weight heatmaps
 

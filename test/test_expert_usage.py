@@ -1,4 +1,4 @@
-"""Check direct checkpoint plotting against the existing gate-analysis calculation."""
+"""Check standalone plotting against full-model inference on raw inputs."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from analysis import plot_selected_watershed_expert_usage as usage
-from analysis.analyze_moe_tau_experts import extract_gate_table
+from test.gate_reference import reference_gate_table
 from neuralhydrology.datasetzoo import get_dataset
 from neuralhydrology.modelzoo import get_model
 from neuralhydrology.utils.config import Config
@@ -43,14 +43,14 @@ def saved_run(tmp_path_factory):
 
 
 @pytest.mark.parametrize("period", ["train", "validation", "test"])
-def test_direct_means_match_existing_analysis(saved_run, period):
+def test_direct_means_match_full_model(saved_run, period):
     run_dir, cfg = saved_run
     scaler_file = run_dir / "train_data/train_data_scaler.yml"
     original_scaler = scaler_file.read_bytes()
     # Five-sample batches leave a partial final batch: every sample must count equally.
     actual = usage.extract_mean_gate_weights(run_dir / "model_epoch000.pt", "yrs",
                                              period=period, batch_size=5)
-    reference = extract_gate_table(cfg, run_dir, ["4"], period, 0, "cpu", 14, False)
+    reference = reference_gate_table(cfg, run_dir, ["4"], period)
     expected = reference[[f"expert_{i}_gate" for i in range(8)]].mean().to_numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
     np.testing.assert_allclose(actual.sum(), 1.0, atol=1e-6)
@@ -108,3 +108,32 @@ def test_original_model_name_loads_without_modifying_saved_config(saved_run, tmp
     expected = usage.extract_mean_gate_weights(run_dir / "model_epoch000.pt", "SCC")
     np.testing.assert_array_equal(actual, expected)
     assert config_file.read_bytes() == original_config
+
+
+def test_training_usage_excludes_missing_history(saved_run, tmp_path, capsys):
+    original_run, _ = saved_run
+    run_dir = tmp_path / "warmup_run"
+    shutil.copytree(original_run, run_dir)
+    config_file = run_dir / "config.yml"
+    cfg = Config(config_file)
+    cfg.update_config({"seq_length": 365, "train_start_date": "01/10/1987", "train_end_date": "03/10/1988"})
+    config_file.unlink()
+    cfg.dump_config(run_dir, filename="config.yml")
+    actual = usage.extract_mean_gate_weights(run_dir / "model_epoch000.pt", "SHA", period="train", batch_size=128)
+    expected = reference_gate_table(cfg, run_dir, ["1"], "train")
+    gate_cols = [f"expert_{i}_gate" for i in range(8)]
+    assert expected[gate_cols].iloc[:364].isna().all().all()
+    np.testing.assert_allclose(actual, expected[gate_cols].mean(), atol=1e-7)
+    assert "Excluded 364 train sequences" in capsys.readouterr().out
+
+
+def test_invalid_weights_are_rejected(saved_run, tmp_path):
+    original_run, _ = saved_run
+    run_dir = tmp_path / "invalid_run"
+    shutil.copytree(original_run, run_dir)
+    checkpoint = run_dir / "model_epoch000.pt"
+    state = torch.load(checkpoint, weights_only=True)
+    state["gating_net.proj.weight"][0, 0] = float("nan")
+    torch.save(state, checkpoint)
+    with pytest.raises(ValueError, match="Checkpoint contains non-finite parameters"):
+        usage.extract_mean_gate_weights(checkpoint, "SHA")

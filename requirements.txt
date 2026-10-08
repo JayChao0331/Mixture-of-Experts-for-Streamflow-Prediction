@@ -1,0 +1,2 @@
+# Install this project and its dependencies declared in setup.py.
+-e .

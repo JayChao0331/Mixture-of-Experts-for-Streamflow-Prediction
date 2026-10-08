@@ -478,7 +478,7 @@ class BaseTrainer(object):
 
         # Add timestamp to avoid overwriting
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"{filename_prefix}_{timestamp}.png"
+        filename = self.cfg.run_dir / f"{filename_prefix}_{timestamp}.png"
 
         plt.savefig(filename, dpi=300)
         plt.close()
