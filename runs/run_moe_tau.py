@@ -318,7 +318,7 @@ def _make_run_name(cfg: Config) -> str:
     hour = f"{now.hour}".zfill(2)
     minute = f"{now.minute}".zfill(2)
     second = f"{now.second}".zfill(2)
-    return f"{cfg.experiment_name}_{day}{month}_{hour}{minute}{second}"
+    return f"{cfg.experiment_name}_{day}{month}_{hour}{minute}{second}_{now.microsecond:06d}"
 
 
 def _get_expected_run_dir(cfg: Config, run_name: str) -> Path:
@@ -473,16 +473,58 @@ def _distributed_debug_worker(rank: int, gpu_ids, master_port: int):
         dist.destroy_process_group()
 
 
-def run_experiments(times=10, gpu: int = None, config_file: Path = CONFIG_FILE):
-    """Train repeated runs from the preserved MoE-tau configuration."""
+def run_experiments(times=5, gpu: int = None, config_file: Path = CONFIG_FILE):
+    """Train five runs by default, with consecutive reproducible random seeds."""
     if times < 1:
         raise ValueError("times must be at least 1.")
     run_dirs = []
-    for _ in range(times):
-        run_dir = _start_training_from_config(config_file, gpu=gpu)
+    cfg = Config(config_file)
+    base_seed = cfg.seed if cfg.seed is not None else SEED
+    for run_idx in range(times):
+        run_seed = int(base_seed + run_idx)
+        print(f"Starting MoE-tau run {run_idx + 1}/{times} with seed {run_seed}", flush=True)
+        run_dir = _start_training_from_config(config_file, seed=run_seed, gpu=gpu)
         run_dirs.append(run_dir)
         print(f"Finished MoE-tau training run: {run_dir}")
     return run_dirs
+
+
+def summarize_experiments(run_dirs, period: str = "test", epoch: int = None):
+    """Average the saved metrics across every run in the current experiment batch."""
+    run_dirs = [Path(path).expanduser().resolve() for path in run_dirs]
+    if not run_dirs or len(set(run_dirs)) != len(run_dirs):
+        raise ValueError("Supply a non-empty list of distinct run folders.")
+    frames = []
+    for run_dir in run_dirs:
+        checkpoint = select_checkpoint(run_dir=run_dir, epoch=epoch)
+        metrics_file = run_dir / period / checkpoint.stem / f"{period}_metrics.csv"
+        frame = pd.read_csv(metrics_file, index_col="basin", dtype={"basin": str})
+        if frame.empty or frame.index.has_duplicates or not len(frame.columns):
+            raise ValueError(f"Expected one metric row per watershed in {metrics_file}.")
+        frame = frame.apply(pd.to_numeric, errors="raise")
+        if not np.isfinite(frame.to_numpy()).all():
+            raise ValueError(f"Non-finite metrics in {metrics_file}; all runs need valid metrics before averaging.")
+        if frames:
+            if set(frame.index) != set(frames[0].index) or set(frame.columns) != set(frames[0].columns):
+                raise ValueError(f"Watersheds and metrics must match across all runs: {metrics_file}.")
+            frame = frame.reindex(index=frames[0].index, columns=frames[0].columns)
+        frames.append(frame)
+
+    metrics_by_run = pd.concat(frames, keys=[str(path) for path in run_dirs], names=["run_dir", "basin"])
+    basin_means = metrics_by_run.groupby(level="basin", sort=False).mean()
+    run_means = metrics_by_run.groupby(level="run_dir", sort=False).mean()
+    overall_means = run_means.mean().to_frame("mean")
+    overall_means.index.name = "metric"
+    cfg = Config(run_dirs[0] / "config.yml")
+    stamp = datetime.now().strftime("%d%m_%H%M%S_%f")
+    summary_dir = run_dirs[0].parent / f"{cfg.experiment_name}_summary_{stamp}"
+    summary_dir.mkdir()
+    metrics_by_run.to_csv(summary_dir / f"{period}_metrics_by_run.csv")
+    basin_means.to_csv(summary_dir / f"{period}_mean_metrics_by_basin.csv")
+    overall_means.to_csv(summary_dir / f"{period}_mean_metrics.csv")
+    _print_metric_table(f"{period.capitalize()} mean metrics across all {len(run_dirs)} runs", overall_means)
+    print(f"Saved experiment averages to {summary_dir}", flush=True)
+    return summary_dir
 
 
 def _read_basin_ids(basin_file: Path):
@@ -763,7 +805,7 @@ def plot_heldout_seasonal_hydrograph(split_key: str,
 
 
 def train_heldout_watershed_experiment(split_key: str,
-                                       times: int = 1,
+                                       times: int = 5,
                                        vary_seed: bool = True,
                                        base_seed: int = SEED):
     """Train one held-out watershed experiment.
@@ -1030,138 +1072,13 @@ def print_checkpoint_nse_fhv_flv(split_key: str,
         _print_metric_table("Failed runs", pd.DataFrame(failed_runs))
 
 
-def test_top_nse_heldout_watershed_checkpoints(split_key: str,
-                                               runs_dir: Path = "./runs",
-                                               epoch: int = None,
-                                               run_name_contains: str = None,
-                                               top_k: int = 6,
-                                               skip_failed: bool = True):
-    """Evaluate all checkpoint folders and summarize the top-k checkpoints by NSE/FHV/FLV score.
-
-    Ranking score:
-    - higher NSE is better.
-    - smaller absolute FHV is better.
-    - smaller absolute FLV is better.
-
-    Each component is min-max normalized across the evaluated checkpoints so that higher is better,
-    then the three normalized components are averaged.
-    """
-    _, split_info = _get_heldout_split(split_key)
-    runs_dir = Path(runs_dir)
-    if not runs_dir.exists():
-        raise FileNotFoundError(f"Runs directory does not exist: {runs_dir}")
-
-    run_dirs = []
-    for run_dir in sorted(runs_dir.iterdir()):
-        if not run_dir.is_dir():
-            continue
-        if run_name_contains is not None and run_name_contains.lower() not in run_dir.name.lower():
-            continue
-        if not list(run_dir.glob("model_epoch*.pt")):
-            continue
-        run_dirs.append(run_dir)
-
-    if not run_dirs:
-        print(f"No checkpoint folders found in {runs_dir}.")
-        return
-
-    metric_rows = []
-    failed_runs = []
-
-    for run_dir in run_dirs:
-        print(f"\nEvaluating held-out {split_info['name']} checkpoint folder: {run_dir}")
-        try:
-            values = _evaluate_single_heldout_basin(run_dir=run_dir, basin_id=split_info["id"], epoch=epoch)
-        except Exception as exc:
-            if not skip_failed:
-                raise
-            failed_runs.append({"run_dir": str(run_dir), "error": str(exc)})
-            print(f"Skipping failed run: {exc}")
-            continue
-
-        row = values.copy()
-        row.update({
-            "run_dir": str(run_dir),
-            "checkpoint": _get_weight_stem(run_dir=run_dir, epoch=epoch),
-        })
-        metric_rows.append(row)
-
-    print(f"\nTotal checkpoint folders found: {len(run_dirs)}")
-    print(f"Successfully evaluated checkpoint folders: {len(metric_rows)}")
-    print(f"Failed checkpoint folders: {len(failed_runs)}")
-
-    if not metric_rows:
-        print("\nNo runs were evaluated successfully.")
-        if failed_runs:
-            _print_metric_table("Failed runs", pd.DataFrame(failed_runs))
-        return
-
-    run_metrics = pd.DataFrame(metric_rows).set_index("run_dir")
-    ranking_metrics = ["NSE", "FHV", "FLV"]
-    missing_metrics = [metric for metric in ranking_metrics if metric not in run_metrics.columns]
-    if missing_metrics:
-        raise KeyError(f"Missing ranking metric(s) {missing_metrics}. Available metrics: {list(run_metrics.columns)}")
-
-    def _normalize_higher_is_better(values: pd.Series) -> pd.Series:
-        values = values.astype(float)
-        value_range = values.max() - values.min()
-        if value_range == 0:
-            return pd.Series(1.0, index=values.index)
-        return (values - values.min()) / value_range
-
-    def _normalize_closer_to_zero_is_better(values: pd.Series) -> pd.Series:
-        errors = values.astype(float).abs()
-        error_range = errors.max() - errors.min()
-        if error_range == 0:
-            return pd.Series(1.0, index=errors.index)
-        return 1.0 - (errors - errors.min()) / error_range
-
-    score_table = pd.DataFrame(index=run_metrics.index)
-    score_table["checkpoint"] = run_metrics["checkpoint"]
-    score_table["NSE"] = run_metrics["NSE"]
-    score_table["FHV"] = run_metrics["FHV"]
-    score_table["FLV"] = run_metrics["FLV"]
-    score_table["NSE_score"] = _normalize_higher_is_better(run_metrics["NSE"])
-    score_table["FHV_abs"] = run_metrics["FHV"].astype(float).abs()
-    score_table["FHV_score"] = _normalize_closer_to_zero_is_better(run_metrics["FHV"])
-    score_table["FLV_abs"] = run_metrics["FLV"].astype(float).abs()
-    score_table["FLV_score"] = _normalize_closer_to_zero_is_better(run_metrics["FLV"])
-    score_table["ranking_score"] = score_table[["NSE_score", "FHV_score", "FLV_score"]].mean(axis=1)
-
-    n_selected = min(top_k, len(run_metrics))
-    top_score_table = score_table.sort_values("ranking_score", ascending=False).head(n_selected)
-    top_metrics = run_metrics.loc[top_score_table.index].copy()
-    metric_columns = top_metrics.select_dtypes(include=[np.number]).columns
-    std_ddof = 1 if len(top_metrics) > 1 else 0
-    summary = pd.DataFrame({
-        "mean": top_metrics[metric_columns].mean(),
-        "std": top_metrics[metric_columns].std(ddof=std_ddof),
-    })
-
-    print(f"\nSelected top {n_selected} checkpoint folders by combined NSE/FHV/FLV score "
-          f"out of {len(run_metrics)} successfully evaluated folders.")
-    print("Ranking score = mean(normalized NSE, normalized closeness of FHV to 0, "
-          "normalized closeness of FLV to 0).")
-    print(f"Top {n_selected} ranking scores: {top_score_table['ranking_score'].tolist()}")
-
-    _print_metric_table(f"Held-out {split_info['name']} MoE-tau top-{n_selected} checkpoint ranking details",
-                        top_score_table)
-    _print_metric_table(f"Held-out {split_info['name']} MoE-tau top-{n_selected} checkpoint metrics",
-                        top_metrics)
-    _print_metric_table(f"Held-out {split_info['name']} MoE-tau top-{n_selected} NSE/FHV/FLV-score summary",
-                        summary)
-
-    if failed_runs:
-        _print_metric_table("Failed runs", pd.DataFrame(failed_runs))
-
-
 def run_heldout_watershed_experiments(split_key: str,
-                                      times: int = 1,
+                                      times: int = 5,
                                       vary_seed: bool = True,
                                       base_seed: int = SEED):
     """Backward-compatible wrapper for held-out training only.
 
-    Testing is intentionally separate. Use test_heldout_watershed_experiment() with the run directory you select.
+    Evaluate the generated run folders with test_all_heldout_watershed_checkpoints().
     """
     return train_heldout_watershed_experiment(split_key=split_key,
                                               times=times,
@@ -1438,7 +1355,7 @@ def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", choices=["train-test", "train", "evaluate"], default="train-test",
                         help="Action to perform (default: train-test, trains then evaluates on the test period).")
-    parser.add_argument("--times", type=int, default=1, help="Number of training runs (default: 1).")
+    parser.add_argument("--times", type=int, default=5, help="Number of training runs (default: 5).")
     parser.add_argument("--run-dir", type=Path, help="Trained run directory to evaluate.")
     parser.add_argument("--period", choices=["train", "validation", "test"], default="test")
     parser.add_argument("--epoch", type=int, help="Checkpoint epoch to evaluate (default: latest).")
@@ -1456,6 +1373,7 @@ def _main():
         if args.mode == "train-test":
             for run_dir in run_dirs:
                 eval_run(run_dir=run_dir, period=args.period, epoch=args.epoch, gpu=args.gpu)
+            summarize_experiments(run_dirs, period=args.period, epoch=args.epoch)
     else:
         if args.run_dir is None:
             parser.error("evaluate requires --run-dir.")

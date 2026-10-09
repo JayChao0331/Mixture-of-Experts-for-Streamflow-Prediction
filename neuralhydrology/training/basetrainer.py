@@ -378,13 +378,6 @@ class BaseTrainer(object):
             self._distributed_barrier()
 
 
-            # Save best checkpoint based on the validation NSE
-            # if epoch % self.cfg.save_weights_every == 0:
-            #     if valid_metrics['avg_total_loss'] <= total_loss_threshold:
-            #         total_loss_threshold = valid_metrics['avg_total_loss']
-            #         self._save_weights_and_optimizer(0)
-
-
             train_loss = avg_losses["avg_loss"]
 
             if train_loss <= save_threshold:

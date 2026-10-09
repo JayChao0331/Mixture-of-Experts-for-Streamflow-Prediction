@@ -20,7 +20,9 @@ python3 -m pip install -r requirements.txt
 python3 runs/run_moe_tau.py
 ```
 
-This trains and tests MoE-tau using `runs/moe_tau.yml`. Results are saved in `runs/moe_tau_<timestamp>/`, with the best training-loss checkpoint in `model_epoch000.pt`. Add `--gpu -1` to run on CPU.
+This trains and tests MoE-tau **five times**, using `runs/moe_tau.yml` and seeds 42–46. It reports the arithmetic mean of the evaluation metrics across all five runs. Add `--gpu -1` to run on CPU.
+
+Each run is saved in `runs/moe_tau_<timestamp>/`, with its best training-loss checkpoint in `model_epoch000.pt`. Overall and per-watershed averages are saved in `runs/moe_tau_summary_<timestamp>/`.
 
 ## Analyses
 
